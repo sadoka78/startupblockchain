@@ -245,6 +245,18 @@ describe("simple_vault", () => {
       .setPaused(false)
       .accounts({ vaultState: vaultStatePDA, admin: admin.publicKey } as any)
       .rpc();
+
+    let unauthorizedFailed = false;
+    try {
+      await program.methods
+        .setPaused(true)
+        .accounts({ vaultState: vaultStatePDA, admin: userA.publicKey } as any)
+        .signers([userA])
+        .rpc();
+    } catch {
+      unauthorizedFailed = true;
+    }
+    assert.isTrue(unauthorizedFailed, "пользователь не должен менять паузу администратора");
   });
 
   it("deposit: три пользователя получают доли по внесённым суммам после комиссии", async () => {

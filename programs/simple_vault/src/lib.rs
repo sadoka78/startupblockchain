@@ -59,6 +59,11 @@ pub mod simple_vault {
             amount >= ctx.accounts.vault_state.min_deposit,
             VaultError::BelowMinimum
         );
+        require_keys_neq!(
+            ctx.accounts.user_token_account.key(),
+            ctx.accounts.fee_wallet.key(),
+            VaultError::FeeWalletConflict
+        );
 
         let vault = &ctx.accounts.vault_state;
         // Комиссия составляет 1% от внесённой суммы и уходит на кошелёк комиссии.
@@ -372,6 +377,8 @@ pub enum VaultError {
     VaultPaused,
     #[msg("Only the vault administrator can do this")]
     Unauthorized,
+    #[msg("The fee wallet cannot also be the depositor's token account")]
+    FeeWalletConflict,
     #[msg("Math overflow")]
     MathOverflow,
 }
