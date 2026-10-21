@@ -15,8 +15,13 @@ pub mod simple_vault {
         vault.token_mint = ctx.accounts.token_mint.key();
         vault.vault_token_account = ctx.accounts.vault_token_account.key();
         vault.share_mint = ctx.accounts.share_mint.key();
+        vault.fee_wallet = ctx.accounts.fee_wallet.key();
         vault.total_tokens = 0;
         vault.total_shares = 0;
+        vault.min_deposit = 10u64
+            .checked_pow(ctx.accounts.token_mint.decimals.into())
+            .ok_or(VaultError::MathOverflow)?;
+        vault.paused = false;
         vault.bump = ctx.bumps.vault_state;
 
         msg!("Vault initialized for mint: {}", vault.token_mint);
@@ -35,6 +40,13 @@ pub mod simple_vault {
         Ok(())
     }
 
+    /// Администратор может временно остановить или снова разрешить депозиты.
+    pub fn set_paused(ctx: Context<AdminVaultAction>, paused: bool) -> Result<()> {
+        ctx.accounts.vault_state.paused = paused;
+        msg!("Vault deposits paused: {}", paused);
+        Ok(())
+    }
+
     /// Пользователь вносит `amount` токенов → получает share-токены.
     ///
     /// Формула:
@@ -42,14 +54,22 @@ pub mod simple_vault {
     ///   Последующие депозиты: shares = amount * total_shares / total_tokens
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, VaultError::ZeroAmount);
+        require!(!ctx.accounts.vault_state.paused, VaultError::VaultPaused);
+        require!(
+            amount >= ctx.accounts.vault_state.min_deposit,
+            VaultError::BelowMinimum
+        );
 
         let vault = &ctx.accounts.vault_state;
+        // Комиссия составляет 1% от внесённой суммы и уходит на кошелёк комиссии.
+        let fee = amount / 100;
+        let amount_to_vault = amount.checked_sub(fee).ok_or(VaultError::MathOverflow)?;
 
         // Сколько shares получит пользователь
         let shares = if vault.total_shares == 0 || vault.total_tokens == 0 {
-            amount // первый депозит: 1 share = 1 token
+            amount_to_vault // первый депозит: 1 share = 1 token, после комиссии
         } else {
-            (amount as u128)
+            (amount_to_vault as u128)
                 .checked_mul(vault.total_shares as u128)
                 .and_then(|v| v.checked_div(vault.total_tokens as u128))
                 .and_then(|v| u64::try_from(v).ok())
@@ -57,7 +77,22 @@ pub mod simple_vault {
         };
         require!(shares > 0, VaultError::SharesTooSmall);
 
-        // 1. Переводим токены: пользователь → vault
+        // 1. Переводим комиссию на заранее выбранный кошелёк.
+        if fee > 0 {
+            token::transfer(
+                CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.user_token_account.to_account_info(),
+                        to: ctx.accounts.fee_wallet.to_account_info(),
+                        authority: ctx.accounts.user.to_account_info(),
+                    },
+                ),
+                fee,
+            )?;
+        }
+
+        // 2. Остаток переводим в vault и начисляем доли только на эту сумму.
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -67,7 +102,7 @@ pub mod simple_vault {
                     authority: ctx.accounts.user.to_account_info(),
                 },
             ),
-            amount,
+            amount_to_vault,
         )?;
 
         // 2. Печатаем shares пользователю (подписывает vault PDA)
@@ -92,18 +127,34 @@ pub mod simple_vault {
             shares,
         )?;
 
-        // 3. Обновляем vault и карточку пользователя
+        // 3. Обновляем остаток vault и карточку. В deposited записываем всю сумму,
+        // которую пользователь оплатил, включая комиссию.
         let vault = &mut ctx.accounts.vault_state;
-        vault.total_tokens = vault.total_tokens.checked_add(amount).ok_or(VaultError::MathOverflow)?;
-        vault.total_shares = vault.total_shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
+        vault.total_tokens = vault
+            .total_tokens
+            .checked_add(amount_to_vault)
+            .ok_or(VaultError::MathOverflow)?;
+        vault.total_shares = vault
+            .total_shares
+            .checked_add(shares)
+            .ok_or(VaultError::MathOverflow)?;
 
         let card = &mut ctx.accounts.user_card;
-        card.deposited = card.deposited.checked_add(amount).ok_or(VaultError::MathOverflow)?;
-        card.shares = card.shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
+        card.deposited = card
+            .deposited
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
+        card.shares = card
+            .shares
+            .checked_add(shares)
+            .ok_or(VaultError::MathOverflow)?;
 
         msg!(
             "Deposit: {} tokens -> {} shares (total_tokens={}, total_shares={})",
-            amount, shares, vault.total_tokens, vault.total_shares
+            amount,
+            shares,
+            vault.total_tokens,
+            vault.total_shares
         );
         Ok(())
     }
@@ -147,6 +198,13 @@ pub struct InitializeVault<'info> {
     )]
     pub share_mint: Account<'info, Mint>,
 
+    /// SPL-аккаунт, на который зачисляется комиссия. Его адрес задаёт администратор.
+    #[account(
+        token::mint = token_mint,
+        token::authority = admin,
+    )]
+    pub fee_wallet: Account<'info, TokenAccount>,
+
     /// SPL-токен, который принимает vault
     pub token_mint: Account<'info, Mint>,
 
@@ -156,6 +214,18 @@ pub struct InitializeVault<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct AdminVaultAction<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", vault_state.token_mint.as_ref()],
+        bump = vault_state.bump,
+        has_one = admin @ VaultError::Unauthorized,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+    pub admin: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -218,6 +288,14 @@ pub struct Deposit<'info> {
     )]
     pub share_mint: Account<'info, Mint>,
 
+    /// Счёт комиссии, сохранённый при создании vault.
+    #[account(
+        mut,
+        address = vault_state.fee_wallet,
+        token::mint = vault_state.token_mint,
+    )]
+    pub fee_wallet: Account<'info, TokenAccount>,
+
     /// Токен-аккаунт пользователя (откуда списываем токены)
     #[account(
         mut,
@@ -253,22 +331,25 @@ pub struct VaultState {
     pub share_mint: Pubkey,          // 32 — mint для shares
     pub total_tokens: u64,           // 8  — всего токенов в vault
     pub total_shares: u64,           // 8  — всего выпущено shares
+    pub fee_wallet: Pubkey,          // 32 — токен-аккаунт для комиссии
+    pub min_deposit: u64,            // 8  — минимум, один токен с учётом decimals
+    pub paused: bool,                // 1  — остановлены ли депозиты
     pub bump: u8,                    // 1
 }
 
 impl VaultState {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 1 + 1;
 }
 
 /// Карточка пользователя в vault.
 #[account]
 #[derive(Default)]
 pub struct UserCard {
-    pub vault: Pubkey, // 32 — к какому vault относится
-    pub owner: Pubkey, // 32 — владелец карточки
+    pub vault: Pubkey,  // 32 — к какому vault относится
+    pub owner: Pubkey,  // 32 — владелец карточки
     pub deposited: u64, // 8 — сколько токенов внёс пользователь
     pub shares: u64,    // 8 — сколько shares у пользователя
-    pub bump: u8,      // 1
+    pub bump: u8,       // 1
 }
 
 impl UserCard {
@@ -285,6 +366,12 @@ pub enum VaultError {
     ZeroAmount,
     #[msg("Shares would be zero - deposit too small")]
     SharesTooSmall,
+    #[msg("Deposit is below the minimum amount")]
+    BelowMinimum,
+    #[msg("Vault deposits are paused by the administrator")]
+    VaultPaused,
+    #[msg("Only the vault administrator can do this")]
+    Unauthorized,
     #[msg("Math overflow")]
     MathOverflow,
 }

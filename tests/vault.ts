@@ -5,8 +5,9 @@
  *   1. Admin создаёт vault (initialize_vault)
  *   2. Пользователи A и B создают свои карточки (create_user_card)
  *   3. Повторное создание карточки A падает
- *   4. A вносит 100 токенов → 100 shares, B вносит 50 → 50 shares
- *   5. Депозит без карточки и депозит 0 — ошибки
+ *   4. Проверяются комиссия 1%, минимальный депозит и пауза администратора
+ *   5. Три пользователя вносят разные суммы и получают shares пропорционально вкладу
+ *   6. Депозит без карточки и депозит 0 — ошибки
  */
 
 import * as anchor from "@coral-xyz/anchor";
@@ -48,6 +49,7 @@ describe("simple_vault", () => {
   let vaultStatePDA: PublicKey;
   let vaultTokenAccountPDA: PublicKey;
   let shareMintPDA: PublicKey;
+  let feeWallet: PublicKey;
 
   // Токен-аккаунты (токен vault) и share-аккаунты пользователей
   const userC = Keypair.generate(); // без карточки
@@ -63,6 +65,7 @@ describe("simple_vault", () => {
         userCard: cardPda(user.publicKey),
         vaultTokenAccount: vaultTokenAccountPDA,
         shareMint: shareMintPDA,
+        feeWallet,
         userTokenAccount: tokenAcc[user.publicKey.toBase58()],
         userShareAccount: shareAcc[user.publicKey.toBase58()],
         user: user.publicKey,
@@ -76,12 +79,20 @@ describe("simple_vault", () => {
       program.programId
     )[0];
 
+  const createCard = async (user: Keypair) =>
+    program.methods
+      .createUserCard()
+      .accounts({ vaultState: vaultStatePDA, userCard: cardPda(user.publicKey), user: user.publicKey } as any)
+      .signers([user])
+      .rpc();
+
   before(async () => {
     await fundFromAdmin(provider, admin, userA.publicKey);
     await fundFromAdmin(provider, admin, userB.publicKey);
     await fundFromAdmin(provider, admin, userC.publicKey);
 
     tokenMint = await createMint(provider.connection, admin, admin.publicKey, null, 6);
+    feeWallet = await createAccount(provider.connection, admin, tokenMint, admin.publicKey);
 
     [vaultStatePDA] = PublicKey.findProgramAddressSync(
       [Buffer.from("vault"), tokenMint.toBuffer()],
@@ -104,6 +115,7 @@ describe("simple_vault", () => {
         vaultState: vaultStatePDA,
         vaultTokenAccount: vaultTokenAccountPDA,
         shareMint: shareMintPDA,
+        feeWallet,
         tokenMint,
         admin: admin.publicKey,
       } as any)
@@ -149,7 +161,7 @@ describe("simple_vault", () => {
     assert.isTrue(failed, "повторная карточка должна быть отклонена");
   });
 
-  it("deposit: A вносит 100 токенов → получает 100 shares", async () => {
+  it("deposit: A вносит 100 токенов, комиссия 1%, в vault поступает 99", async () => {
     // Токен-аккаунты пользователей и стартовые токены
     for (const user of [userA, userB, userC]) {
       const key = user.publicKey.toBase58();
@@ -161,25 +173,28 @@ describe("simple_vault", () => {
     await deposit(userA, 100 * UNIT);
 
     const shares = await getAccount(provider.connection, shareAcc[userA.publicKey.toBase58()]);
-    assert.equal(shares.amount, BigInt(100 * UNIT));
+    assert.equal(shares.amount, BigInt(99 * UNIT));
 
     const card = await program.account.userCard.fetch(cardPda(userA.publicKey));
     assert.equal(card.deposited.toNumber(), 100 * UNIT);
-    assert.equal(card.shares.toNumber(), 100 * UNIT);
+    assert.equal(card.shares.toNumber(), 99 * UNIT);
+
+    const feeBalance = await getAccount(provider.connection, feeWallet);
+    assert.equal(feeBalance.amount, BigInt(UNIT));
   });
 
-  it("deposit: B вносит 50 токенов → получает 50 shares", async () => {
+  it("deposit: B вносит 50 токенов → получает shares на 49.5 токена после комиссии", async () => {
     await deposit(userB, 50 * UNIT);
 
     const shares = await getAccount(provider.connection, shareAcc[userB.publicKey.toBase58()]);
-    assert.equal(shares.amount, BigInt(50 * UNIT));
+    assert.equal(shares.amount, BigInt(49.5 * UNIT));
 
     const vault = await program.account.vaultState.fetch(vaultStatePDA);
-    assert.equal(vault.totalTokens.toNumber(), 150 * UNIT);
-    assert.equal(vault.totalShares.toNumber(), 150 * UNIT);
+    assert.equal(vault.totalTokens.toNumber(), 148.5 * UNIT);
+    assert.equal(vault.totalShares.toNumber(), 148.5 * UNIT);
 
     const vaultTokens = await getAccount(provider.connection, vaultTokenAccountPDA);
-    assert.equal(vaultTokens.amount, BigInt(150 * UNIT));
+    assert.equal(vaultTokens.amount, BigInt(148.5 * UNIT));
   });
 
   it("deposit: без карточки — ошибка", async () => {
@@ -200,5 +215,53 @@ describe("simple_vault", () => {
       failed = true;
     }
     assert.isTrue(failed, "нулевой депозит должен быть отклонён");
+  });
+
+  it("deposit: сумма меньше одного токена — ошибка", async () => {
+    let failed = false;
+    try {
+      await deposit(userA, UNIT - 1);
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "депозит меньше минимального должен быть отклонён");
+  });
+
+  it("set_paused: администратор может остановить и возобновить депозиты", async () => {
+    await program.methods
+      .setPaused(true)
+      .accounts({ vaultState: vaultStatePDA, admin: admin.publicKey } as any)
+      .rpc();
+
+    let failed = false;
+    try {
+      await deposit(userA, UNIT);
+    } catch {
+      failed = true;
+    }
+    assert.isTrue(failed, "депозит во время паузы должен быть отклонён");
+
+    await program.methods
+      .setPaused(false)
+      .accounts({ vaultState: vaultStatePDA, admin: admin.publicKey } as any)
+      .rpc();
+  });
+
+  it("deposit: три пользователя получают доли по внесённым суммам после комиссии", async () => {
+    await createCard(userC);
+    await deposit(userC, 25 * UNIT);
+
+    const userAShares = await getAccount(provider.connection, shareAcc[userA.publicKey.toBase58()]);
+    const userBShares = await getAccount(provider.connection, shareAcc[userB.publicKey.toBase58()]);
+    const userCShares = await getAccount(provider.connection, shareAcc[userC.publicKey.toBase58()]);
+    const vault = await program.account.vaultState.fetch(vaultStatePDA);
+    const feeBalance = await getAccount(provider.connection, feeWallet);
+
+    assert.equal(userAShares.amount, BigInt(99 * UNIT));
+    assert.equal(userBShares.amount, BigInt(49.5 * UNIT));
+    assert.equal(userCShares.amount, BigInt(24.75 * UNIT));
+    assert.equal(vault.totalTokens.toNumber(), 173.25 * UNIT);
+    assert.equal(vault.totalShares.toNumber(), 173.25 * UNIT);
+    assert.equal(feeBalance.amount, BigInt(1.75 * UNIT));
   });
 });
