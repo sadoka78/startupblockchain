@@ -1,198 +1,82 @@
-# Simple Vault — практика Anchor
+# Simple Vault — наша практика на Anchor
 
-Учебный контракт на Anchor 0.31.1 (Solana). Сейчас он делает три вещи:
+Мы взяли за основу учебную ветку `students-vault-card` и разобрали, как на Anchor создать vault для SPL-токена. В этой работе мы выполнили задания 8 и 9: создали PDA хранилища и пользовательские карточки, а затем добавили депозиты и share-токены. Дополнительные пункты из README тоже реализовали.
 
-1. **Vault создан** — админ создаёт vault для SPL-токена. *(неделя 8)*
-2. **У каждого пользователя своя «карточка»** — личный аккаунт (PDA) внутри vault. *(неделя 8)*
-3. **Депозит и share-токены** — пользователь вносит токены и получает share-токены. *(неделя 9)*
+Контракт написан на Anchor 0.31.1 для Solana. Исходная версия задания уже содержала создание vault, карточек и депозитов. Мы добавили комиссию, минимальный депозит, остановку депозитов администратором и дополнительные тесты.
 
-Контракт будет дорабатываться (вывод, Raydium и т.д.), поэтому он намеренно небольшой.
+## Что умеет наша программа
 
----
+- `initialize_vault` создаёт `VaultState` PDA, токен-аккаунт vault и mint для share-токенов.
+- `create_user_card` создаёт одну PDA-карточку пользователя для выбранного vault.
+- `deposit(amount)` переводит токены в vault и выпускает пользователю shares.
+- `set_paused(paused)` позволяет администратору приостановить или возобновить депозиты.
 
-## Что делает контракт
+### Задание 8: vault и карточки
 
-```
-initialize_vault    создаёт VaultState PDA, vault token account и share mint
-create_user_card    создаёт UserCard PDA — личную карточку пользователя в vault
-deposit(amount)     переводит токены пользователя в vault → печатает ему shares
-```
+Администратор создаёт хранилище для выбранного mint. Основное состояние имеет seeds `vault` и адрес mint. Вместе с ним программа создаёт токен-аккаунт, которым владеет PDA vault, и отдельный mint для shares.
 
-### `initialize_vault`
+У пользователя есть `UserCard` с seeds `user_card`, адресом vault и публичным ключом пользователя. Поэтому для одного пользователя и одного vault создаётся только одна карточка. В ней хранятся адреса владельца и vault, сумма депозитов, число shares и bump. Депозит без карточки не проходит.
 
-Вызывает админ (платит за аккаунты). Создаёт три аккаунта для выбранного `token_mint`:
+### Задание 9: депозит и shares
 
-| Аккаунт | Seeds | Что хранит |
-|---|---|---|
-| `vault_state` | `["vault", token_mint]` | admin, token_mint, адреса token account и share mint, `total_tokens`, `total_shares`, bump |
-| `vault_token_account` | `["vault_tokens", token_mint]` | токен-аккаунт, владелец — vault PDA |
-| `share_mint` | `["share_mint", token_mint]` | mint для shares (6 decimals), authority — vault PDA |
+Пользователь подписывает перевод SPL-токенов. Программа удерживает комиссию 1% на настроенный токен-аккаунт, а оставшуюся сумму отправляет в vault. Shares начисляются только на сумму, которая остаётся в vault:
 
-### `create_user_card`
-
-Вызывает любой пользователь (платит за свою карточку). Создаёт `UserCard`:
-
-| Поле | Описание |
-|---|---|
-| `vault` | к какому vault относится карточка |
-| `owner` | владелец карточки |
-| `deposited` | сколько токенов пользователь внёс всего |
-| `shares` | сколько share-токенов он получил |
-| `bump` | bump PDA |
-
-Seeds: `["user_card", vault_state, user]` — поэтому у одного пользователя в одном vault
-может быть **только одна** карточка. Повторный вызов завершится ошибкой.
-
-### `deposit(amount)`
-
-Пользователь вносит `amount` токенов и получает share-токены — «квитанции» с его долей в vault.
-**Депозит возможен только после `create_user_card`** — без карточки инструкция вернёт ошибку.
-
-Что происходит по шагам:
-
-1. Считается, сколько shares положено пользователю.
-2. Токены переводятся с токен-аккаунта пользователя в `vault_token_account`.
-3. Vault печатает shares на share-аккаунт пользователя (подписывает сам vault PDA).
-4. Обновляются `total_tokens` и `total_shares` в vault, а также `deposited` и `shares` в карточке.
-
-**Формула shares:**
-
-```
-Первый депозит:       shares = amount                         (1:1)
-Последующие депозиты: shares = amount × total_shares / total_tokens
+```text
+Первый депозит:       shares = чистая_сумма_депозита
+Следующие депозиты:   shares = чистая_сумма_депозита × total_shares / total_tokens
 ```
 
-Пример: A вносит 100 токенов → получает 100 shares. Потом B вносит 50 → получает 50 shares.
-В vault 150 токенов и 150 shares, у A доля 2/3, у B — 1/3.
+Здесь `total_tokens` — количество токенов, уже находящихся в vault. В карточке `deposited` хранится полная сумма, которую пользователь внёс до комиссии. Минимальный депозит равен одному целому токену с учётом decimals исходного mint. Если администратор включил паузу, программа отклоняет депозиты.
 
-Ошибки: `ZeroAmount` (сумма 0), `SharesTooSmall` (депозит слишком мал, shares вышло бы 0), `MathOverflow`.
-
-Для вызова `deposit` нужны: токен-аккаунт пользователя (с токенами vault) и share-аккаунт пользователя
-(для share mint). В тестах они создаются через `createAccount` из `@solana/spl-token`.
-
----
-
-## Требования
-
-| Инструмент | Версия | Установка |
-|---|---|---|
-| Rust | stable | https://rustup.rs |
-| Solana CLI | 1.18+ | https://docs.solana.com/cli/install-solana-cli-tools |
-| Anchor CLI | 0.31.1 | `cargo install --git https://github.com/coral-xyz/anchor avm --locked && avm install 0.31.1 && avm use 0.31.1` |
-| Node.js | 18+ | https://nodejs.org |
-| Yarn | any | `npm i -g yarn` |
-
-Rust-зависимости (`anchor-lang`, `anchor-spl` 0.31.1) подтянутся сами при `anchor build`.
-JS-зависимости (`@coral-xyz/anchor`, `@solana/web3.js`, `@solana/spl-token`, `mocha`, `chai`, `typescript`) — через `yarn install`.
-
----
-
-## Быстрый старт
-
-### 1. Установить зависимости
-
-```bash
-cd vault-simple
-yarn install
-```
-
-### 2. Сбилдить контракт
-
-```bash
-anchor build
-```
-
-Если билдишь **первый раз** (новый keypair):
-
-```bash
-anchor keys sync   # обновит declare_id! в lib.rs и Anchor.toml
-anchor build       # пересобрать с правильным ID
-```
-
-Артефакты в `target/deploy/`:
-- `simple_vault.so` — программа
-- `simple_vault-keypair.json` — keypair (не коммитить!)
-
-### 3. Настроить Solana CLI на devnet
-
-```bash
-solana config set --url devnet
-solana address     # твой публичный ключ — запомни его
-solana balance
-```
-
-### 4. Пополнить кошелёк
-
-Для деплоя нужно ~2 SOL.
-
-```bash
-solana airdrop 2   # может не сработать из-за rate limit
-```
-
-Если rate limit — используй faucet:
-- https://faucet.solana.com (вставь свой адрес)
-
-### 5. Задеплоить
-
-```bash
-anchor deploy --provider.cluster devnet
-```
-
-### 6. Запустить тесты
-
-```bash
-yarn test
-```
-
-Ожидаемый вывод:
-
-```
-✔ initialize_vault: vault создан
-✔ create_user_card: у каждого пользователя своя карточка
-✔ create_user_card: вторая карточка для того же пользователя — ошибка
-✔ deposit: A вносит 100 токенов → получает 100 shares
-✔ deposit: B вносит 50 токенов → получает 50 shares
-✔ deposit: без карточки — ошибка
-✔ deposit: сумма 0 — ошибка
-7 passing
-```
-
----
+В тесте три пользователя вносят 100, 50 и 25 токенов. После комиссии в vault поступают 99, 49,5 и 24,75 токена; при начальном курсе 1:1 они получают столько же shares. Мы также проверяем, что пользователь без карточки не может внести депозит, повторную карточку нельзя создать, нулевой и слишком маленький депозиты отклоняются, а паузу может менять только администратор.
 
 ## Структура проекта
 
+```text
+programs/simple_vault/src/lib.rs   контракт и инструкции
+tests/vault.ts                    тесты Anchor
+weeks/08-vault.md                 отчёт за неделю 8
+weeks/09-deposit-shares.md        отчёт за неделю 9
+Anchor.toml                       настройки Anchor и Devnet
+Cargo.toml                        Rust workspace
+package.json                      JavaScript-зависимости и команды
 ```
-vault-simple/
-├── programs/simple_vault/src/lib.rs   # контракт
-├── tests/vault.ts                     # тесты
-├── Anchor.toml
-├── Cargo.toml
-└── package.json
+
+## Как запустить
+
+Нужны Rust stable, Solana CLI, Anchor CLI 0.31.1, Node.js 18+ и Yarn.
+
+```bash
+yarn install
+anchor build
 ```
 
----
+Для новой программы сначала проверьте ID программы в `Anchor.toml` и `declare_id!` в `lib.rs`. После установки программы в Devnet запустите тесты:
 
-## Частые ошибки
+```bash
+anchor deploy --provider.cluster devnet
+yarn test
+```
 
-| Ошибка | Причина | Решение |
-|---|---|---|
-| `Insufficient funds` при деплое | мало SOL | пополни кошелёк на devnet |
-| `AccountNotInitialized` в тестах | программа не задеплоена или другой ID | `anchor keys sync` → `anchor build` → `anchor deploy` |
-| `already in use` при `create_user_card` | у пользователя уже есть карточка | это ожидаемо, карточка одна на пользователя |
-| `AccountNotInitialized` (`user_card`) при `deposit` | нет карточки | сначала вызови `create_user_card` |
-| `ZeroAmount` | `amount = 0` | вноси сумму больше нуля |
-| `SharesTooSmall` | депозит слишком мал относительно vault | увеличь сумму |
-| `429 Too Many Requests` | лимит публичного devnet RPC | подожди или возьми свой RPC |
+В `Anchor.toml` тесты настроены на Devnet без локального деплоя. Поэтому перед `yarn test` программа должна быть опубликована по указанному адресу, а кошелёк Anchor должен иметь достаточно тестовых SOL. В тестах создаются новый mint, vault и карточки пользователей.
 
----
+Мы проверили форматирование Rust и компиляцию контракта командой `cargo check`. Anchor CLI в нашей рабочей среде недоступен, поэтому полный запуск тестов в Devnet пока не подтверждён.
 
-## Задания для практики
+## История коммитов
 
-Дополнительные задания выполнены: комиссия 1% отправляется на `fee_wallet`, минимум равен одному целому токену, администратор может приостанавливать депозиты, а тест сравнивает доли трёх пользователей. Реализация находится в локальных коммитах `5c1aafbb9fc222be07f728b63d9d1d2d8926162a` и `c4f9186883833f5870aa7edeb9c5fbed96e7b6d5`.
+Исходные коммиты учебной ветки:
 
-## Отчёты по неделям и коммиты
+- Неделя 8, создание vault: [`5870547`](https://github.com/0xnurda/vault-dev/commit/5870547bb6acdd80a58a49431f4dc65f77032a2c).
+- Неделя 8, карточки пользователей: [`d21d974`](https://github.com/0xnurda/vault-dev/commit/d21d974827f7dbdb9c4a186eaf5e1e1860a01ff9).
+- Неделя 9, депозит и shares: [`38db796`](https://github.com/0xnurda/vault-dev/commit/38db7964441b8b2c62d1d6c9a0457e9434262711).
 
-- Неделя 8: [создание vault и карточек](weeks/08-vault.md). Основные изменения: `5870547` (vault) и `d21d974` (карточка пользователя).
-- Неделя 9: [депозит и shares](weeks/09-deposit-shares.md). Основной коммит: `38db796`; дополнительные задания: локальные коммиты `5c1aafb` и `c4f9186`.
+Наши изменения и отчёты находятся в ветке [`students-vault-card` нашего репозитория](https://github.com/sadoka78/startupblockchain/tree/students-vault-card):
 
-Коммиты `5870547`, `d21d974` и `38db796` уже находятся в исходной ветке `students-vault-card`. Наши коммиты `5c1aafb` и `c4f9186` созданы локально и пока не отправлены в GitHub.
+- `5c1aafbb9fc222be07f728b63d9d1d2d8926162a` — комиссия, минимум депозита, пауза и тест трёх пользователей.
+- `c4f9186883833f5870aa7edeb9c5fbed96e7b6d5` — проверка прав администратора и защита счёта комиссии.
+- `3ddccdc10309df2f36b05421a06b7ffc8e3968c7` — отчёты по неделям 8 и 9.
+
+## Отчёты
+
+- [Неделя 8 — vault и PDA-карточки](weeks/08-vault.md)
+- [Неделя 9 — депозиты и shares](weeks/09-deposit-shares.md)
